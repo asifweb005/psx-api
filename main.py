@@ -19,41 +19,71 @@ def to_int(v):
     try: return int(str(v).replace(",","")) if v is not None else 0
     except: return 0
 
+# Sector code to name mapping
+SECTOR_NAMES = {
+    "807": "Commercial Banks", "806": "Insurance",
+    "101": "Oil & Gas Exploration", "102": "Oil & Gas Marketing",
+    "201": "Cement", "301": "Fertilizer",
+    "401": "Automobile Assembler", "402": "Automobile Parts",
+    "501": "Technology & Communication", "601": "Pharmaceuticals",
+    "701": "Food & Personal Care", "801": "Power Generation",
+    "901": "Textile Composite",
+}
+
+def sector_name(code):
+    key = str(code).replace(".0","").strip()
+    return SECTOR_NAMES.get(key, key)
+
 def quote_to_stock(sym, df):
-    """Convert psxdata.quote() DataFrame row to our standard format"""
     if df is None or len(df) == 0:
         return None
-    # Get first row as dict
     row = df.iloc[0].to_dict()
-    
-    # psxdata columns (from debug): symbol, sector, ..., free_float, volume_avg_30d
-    # Get price fields — check all possible names
-    close  = to_float(row.get("close") or row.get("CLOSE") or row.get("last_price") or 0)
-    ldcp   = to_float(row.get("ldcp") or row.get("LDCP") or row.get("prev_close") or 0)
-    open_  = to_float(row.get("open") or row.get("OPEN") or 0)
-    high   = to_float(row.get("high") or row.get("HIGH") or 0)
-    low    = to_float(row.get("low") or row.get("LOW") or 0)
-    vol    = to_int(row.get("volume") or row.get("VOLUME") or 0)
-    change = to_float(row.get("change") or row.get("CHANGE") or 0)
-    chgpct = to_float(row.get("change_pct") or row.get("CHANGE%") or row.get("change%") or 0)
-    sector = str(row.get("sector") or row.get("SECTOR") or "")
-    name   = str(row.get("company") or row.get("COMPANY") or row.get("name") or sym)
 
-    if close == 0: close = ldcp
+    price     = to_float(row.get("price"))
+    change_pct = to_float(row.get("change_pct"))
+    pe        = to_float(row.get("pe_ratio"))
+    div_yield = to_float(row.get("dividend_yield"))
+    vol_avg   = to_float(row.get("volume_avg_30d"))
+
+    # Derive change amount from price and change_pct
+    # price = ldcp * (1 + change_pct/100)  =>  ldcp = price / (1 + change_pct/100)
+    if change_pct != 0:
+        ldcp = price / (1 + change_pct / 100)
+        change = price - ldcp
+    else:
+        ldcp = price
+        change = 0.0
 
     return {
         "SYMBOL": sym,
-        "COMPANY": name,
-        "SECTOR": sector,
-        "LDCP": ldcp,
-        "OPEN": open_,
-        "HIGH": high,
-        "LOW": low,
-        "CLOSE": close,
-        "VOLUME": vol,
-        "CHANGE": change,
-        "CHANGE%": chgpct,
+        "COMPANY": sym,  # psxdata doesn't return company name in quote
+        "SECTOR": sector_name(row.get("sector", "")),
+        "LDCP": round(ldcp, 2),
+        "OPEN": price,   # not available — use price as proxy
+        "HIGH": price,
+        "LOW": price,
+        "CLOSE": price,
+        "VOLUME": to_int(vol_avg),
+        "CHANGE": round(change, 2),
+        "CHANGE%": change_pct,
+        "PE_RATIO": pe,
+        "DIVIDEND_YIELD": div_yield,
+        "LISTED_IN": str(row.get("listed_in", "")),
     }
+
+TOP_STOCKS = [
+    "HBL","UBL","MCB","ABL","BAFL","BAHL","MEBL","SILK","JSBL",
+    "OGDC","PPL","MARI","POL","PARCO",
+    "ENGRO","EFERT","FATIMA","FFC","FFBL",
+    "LUCK","DGKC","FCCL","KOHC","PIOC","CHCC",
+    "HUBC","KAPCO","KEL","NCPL",
+    "PSO","APL","HASCOL","SHEL",
+    "TRG","SYS","NETSOL","AVN","TPLP",
+    "SEARL","ABOT","HINOON","GLAXO","FEROZ",
+    "PSMC","INDU","HCAR","SAZEW",
+    "NESTLE","UNITY","TREET",
+    "PAKT","LOTCHEM","ICI","SITC",
+]
 
 @app.get("/health")
 def health():
@@ -61,43 +91,27 @@ def health():
 
 @app.get("/debug-quote")
 def debug_quote():
-    """Shows ALL columns of a single quote"""
     try:
         df = psxdata.quote("HBL")
         row = df.iloc[0].to_dict()
-        return {
-            "columns": list(df.columns),
-            "row": {k: str(v) for k, v in row.items()}
-        }
+        return {"columns": list(df.columns), "row": {k: str(v) for k,v in row.items()}}
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/market-watch")
 def market_watch():
     try:
-        top_stocks = [
-            "HBL","UBL","MCB","ABL","BAFL","BAHL","MEBL",
-            "OGDC","PPL","MARI","POL",
-            "ENGRO","EFERT","FATIMA","FFC",
-            "LUCK","DGKC","FCCL","KOHC","PIOC",
-            "HUBC","KAPCO","KEL",
-            "PSO","APL",
-            "TRG","SYS","NETSOL",
-            "SEARL","ABOT","HINOON",
-            "PSMC","INDU","HCAR",
-            "NESTLE","UNITY",
-        ]
         result = []
-        for sym in top_stocks:
+        for sym in TOP_STOCKS:
             try:
                 df = psxdata.quote(sym)
                 stock = quote_to_stock(sym, df)
-                if stock:
+                if stock and stock["CLOSE"] > 0:
                     result.append(stock)
             except:
                 continue
         if not result:
-            raise HTTPException(status_code=500, detail="No data fetched")
+            raise HTTPException(status_code=500, detail="No data")
         return result
     except HTTPException:
         raise
@@ -105,7 +119,7 @@ def market_watch():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/quote/{symbol}")
-def quote(symbol: str):
+def quote_endpoint(symbol: str):
     try:
         df = psxdata.quote(symbol.upper())
         stock = quote_to_stock(symbol.upper(), df)
