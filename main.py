@@ -11,49 +11,98 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def to_float(v):
+    try: return float(v) if v is not None else 0.0
+    except: return 0.0
+
+def to_int(v):
+    try: return int(str(v).replace(",","")) if v is not None else 0
+    except: return 0
+
+def row_to_dict(row):
+    """Convert DataFrame row or dict to plain dict"""
+    if hasattr(row, 'to_dict'):
+        return row.to_dict()
+    if hasattr(row, '_asdict'):
+        return row._asdict()
+    return dict(row)
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+@app.get("/debug")
+def debug():
+    try:
+        # Check what sectors() returns — it has full market data
+        data = psxdata.sectors()
+        t = str(type(data))
+        if hasattr(data, 'head'):
+            sample = str(data.head(2).to_dict())
+            cols = list(data.columns)
+        elif isinstance(data, list):
+            sample = str(data[:2])
+            cols = list(data[0].keys()) if data else []
+        else:
+            sample = str(data)[:300]
+            cols = []
+        return {"type": t, "columns": cols, "sample": sample[:500]}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/market-watch")
 def market_watch():
     try:
-        data = psxdata.tickers()
+        # psxdata.sectors() returns DataFrame with sector-level data
+        # We need per-stock data — use tickers() to get symbols
+        # then batch quote them, or use the underlying market data
         
-        # Handle both list and DataFrame
-        if hasattr(data, 'iterrows'):
-            # It's a DataFrame
-            rows = []
-            for _, row in data.iterrows():
-                rows.append(dict(row))
-            data = rows
+        symbols = psxdata.tickers()  # list of symbol strings
         
-        # data is now a list of dicts
-        result = []
-        for item in data:
-            if isinstance(item, dict):
-                symbol = str(item.get("SYMBOL") or item.get("symbol") or "")
+        # Get KSE100 constituents first (most important stocks)
+        try:
+            kse = psxdata.indices("KSE100")
+            if hasattr(kse, 'tolist'):
+                kse_symbols = kse.tolist()
+            elif isinstance(kse, list):
+                kse_symbols = kse
             else:
-                symbol = str(getattr(item, "SYMBOL", "") or "")
-            
-            if not symbol:
-                continue
+                kse_symbols = list(kse)
+        except:
+            kse_symbols = symbols[:50]
+
+        result = []
+        # Fetch quotes for top stocks (limit to avoid timeout)
+        for sym in kse_symbols[:30]:
+            try:
+                q = psxdata.quote(sym)
+                if q is None:
+                    continue
+                d = row_to_dict(q) if not isinstance(q, dict) else q
                 
-            result.append({
-                "SYMBOL": symbol.upper(),
-                "COMPANY": str(item.get("COMPANY") or item.get("company") or symbol),
-                "SECTOR": str(item.get("SECTOR") or item.get("sector") or ""),
-                "LDCP": float(item.get("LDCP") or item.get("ldcp") or 0),
-                "OPEN": float(item.get("OPEN") or item.get("open") or 0),
-                "HIGH": float(item.get("HIGH") or item.get("high") or 0),
-                "LOW": float(item.get("LOW") or item.get("low") or 0),
-                "CLOSE": float(item.get("CLOSE") or item.get("close") or 0),
-                "VOLUME": int(item.get("VOLUME") or item.get("volume") or 0),
-                "CHANGE": float(item.get("CHANGE") or item.get("change") or 0),
-                "CHANGE%": float(item.get("CHANGE%") or item.get("change%") or 0),
-            })
+                result.append({
+                    "SYMBOL": str(sym),
+                    "COMPANY": str(d.get("COMPANY") or d.get("company") or sym),
+                    "SECTOR": str(d.get("SECTOR") or d.get("sector") or ""),
+                    "LDCP": to_float(d.get("LDCP") or d.get("ldcp")),
+                    "OPEN": to_float(d.get("OPEN") or d.get("open")),
+                    "HIGH": to_float(d.get("HIGH") or d.get("high")),
+                    "LOW": to_float(d.get("LOW") or d.get("low")),
+                    "CLOSE": to_float(d.get("CLOSE") or d.get("close")),
+                    "VOLUME": to_int(d.get("VOLUME") or d.get("volume")),
+                    "CHANGE": to_float(d.get("CHANGE") or d.get("change")),
+                    "CHANGE%": to_float(d.get("CHANGE%") or d.get("change%") or d.get("CHANGE_PCT")),
+                })
+            except Exception as e:
+                continue
+        
+        if not result:
+            raise HTTPException(status_code=500, detail="No quotes fetched")
         
         return result
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -61,9 +110,12 @@ def market_watch():
 def quote(symbol: str):
     try:
         q = psxdata.quote(symbol.upper())
-        if hasattr(q, 'to_dict'):
-            return q.to_dict()
-        return q
+        if q is None:
+            raise HTTPException(status_code=404, detail="Symbol not found")
+        d = row_to_dict(q) if not isinstance(q, dict) else q
+        return d
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -75,22 +127,15 @@ def history(symbol: str):
         start = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
         df = psxdata.stocks(symbol.upper(), start=start, end=end)
         if hasattr(df, 'to_dict'):
-            return df.to_dict(orient="records")
+            records = df.to_dict(orient="records")
+            # Convert any Timestamp keys to strings
+            clean = []
+            for r in records:
+                clean.append({str(k): (v.isoformat() if hasattr(v,'isoformat') else v) 
+                              for k,v in r.items()})
+            return clean
         if isinstance(df, list):
             return df
         return []
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
-
-@app.get("/debug")
-def debug():
-    """Shows raw psxdata output so we can see the exact structure"""
-    try:
-        data = psxdata.tickers()
-        sample = data[:2] if isinstance(data, list) else str(data)[:500]
-        return {
-            "type": str(type(data)),
-            "sample": str(sample),
-        }
-    except Exception as e:
-        return {"error": str(e)}
