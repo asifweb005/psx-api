@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import psxdata
-import json
 
 app = FastAPI(title="PSX Data API", version="1.0.0")
 
@@ -19,26 +18,41 @@ def health():
 @app.get("/market-watch")
 def market_watch():
     try:
-        tickers = psxdata.tickers()
+        data = psxdata.tickers()
+        
+        # Handle both list and DataFrame
+        if hasattr(data, 'iterrows'):
+            # It's a DataFrame
+            rows = []
+            for _, row in data.iterrows():
+                rows.append(dict(row))
+            data = rows
+        
+        # data is now a list of dicts
         result = []
-        for _, row in tickers.iterrows():
-            try:
-                q = psxdata.quote(row["SYMBOL"])
-                result.append({
-                    "SYMBOL": str(row.get("SYMBOL", "")),
-                    "COMPANY": str(row.get("COMPANY", "")),
-                    "SECTOR": str(row.get("SECTOR", "")),
-                    "LDCP": float(q.get("LDCP", 0) or 0),
-                    "OPEN": float(q.get("OPEN", 0) or 0),
-                    "HIGH": float(q.get("HIGH", 0) or 0),
-                    "LOW": float(q.get("LOW", 0) or 0),
-                    "CLOSE": float(q.get("CLOSE", 0) or 0),
-                    "VOLUME": int(q.get("VOLUME", 0) or 0),
-                    "CHANGE": float(q.get("CHANGE", 0) or 0),
-                    "CHANGE%": float(q.get("CHANGE%", 0) or 0),
-                })
-            except Exception:
-                pass
+        for item in data:
+            if isinstance(item, dict):
+                symbol = str(item.get("SYMBOL") or item.get("symbol") or "")
+            else:
+                symbol = str(getattr(item, "SYMBOL", "") or "")
+            
+            if not symbol:
+                continue
+                
+            result.append({
+                "SYMBOL": symbol.upper(),
+                "COMPANY": str(item.get("COMPANY") or item.get("company") or symbol),
+                "SECTOR": str(item.get("SECTOR") or item.get("sector") or ""),
+                "LDCP": float(item.get("LDCP") or item.get("ldcp") or 0),
+                "OPEN": float(item.get("OPEN") or item.get("open") or 0),
+                "HIGH": float(item.get("HIGH") or item.get("high") or 0),
+                "LOW": float(item.get("LOW") or item.get("low") or 0),
+                "CLOSE": float(item.get("CLOSE") or item.get("close") or 0),
+                "VOLUME": int(item.get("VOLUME") or item.get("volume") or 0),
+                "CHANGE": float(item.get("CHANGE") or item.get("change") or 0),
+                "CHANGE%": float(item.get("CHANGE%") or item.get("change%") or 0),
+            })
+        
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -47,6 +61,8 @@ def market_watch():
 def quote(symbol: str):
     try:
         q = psxdata.quote(symbol.upper())
+        if hasattr(q, 'to_dict'):
+            return q.to_dict()
         return q
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -58,6 +74,23 @@ def history(symbol: str):
         end = datetime.today().strftime("%Y-%m-%d")
         start = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
         df = psxdata.stocks(symbol.upper(), start=start, end=end)
-        return df.to_dict(orient="records")
+        if hasattr(df, 'to_dict'):
+            return df.to_dict(orient="records")
+        if isinstance(df, list):
+            return df
+        return []
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/debug")
+def debug():
+    """Shows raw psxdata output so we can see the exact structure"""
+    try:
+        data = psxdata.tickers()
+        sample = data[:2] if isinstance(data, list) else str(data)[:500]
+        return {
+            "type": str(type(data)),
+            "sample": str(sample),
+        }
+    except Exception as e:
+        return {"error": str(e)}
