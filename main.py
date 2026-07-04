@@ -1,15 +1,28 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import psxdata
+import os
+import json
+import urllib.request
+import urllib.error
 
-app = FastAPI(title="PSX Data API", version="1.0.0")
+app = FastAPI(title="PSX Data & AI API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
+
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+]
 
 def to_float(v):
     try: return float(v) if v is not None else 0.0
@@ -19,15 +32,13 @@ def to_int(v):
     try: return int(str(v).replace(",","")) if v is not None else 0
     except: return 0
 
-# Sector code to name mapping
 SECTOR_NAMES = {
-    "807": "Commercial Banks", "806": "Insurance",
-    "101": "Oil & Gas Exploration", "102": "Oil & Gas Marketing",
-    "201": "Cement", "301": "Fertilizer",
-    "401": "Automobile Assembler", "402": "Automobile Parts",
-    "501": "Technology & Communication", "601": "Pharmaceuticals",
-    "701": "Food & Personal Care", "801": "Power Generation",
-    "901": "Textile Composite",
+    "807":"Commercial Banks","806":"Insurance",
+    "820":"Oil & Gas Exploration","821":"Oil & Gas Marketing",
+    "804":"Cement","809":"Fertilizer","824":"Power Generation",
+    "828":"Technology & Communication","823":"Pharmaceuticals",
+    "810":"Food & Personal Care","801":"Automobile Assembler",
+    "805":"Chemical","832":"Tobacco","838":"Miscellaneous",
 }
 
 def sector_name(code):
@@ -38,46 +49,37 @@ def quote_to_stock(sym, df):
     if df is None or len(df) == 0:
         return None
     row = df.iloc[0].to_dict()
-
     price     = to_float(row.get("price"))
     change_pct = to_float(row.get("change_pct"))
-    pe        = to_float(row.get("pe_ratio"))
-    div_yield = to_float(row.get("dividend_yield"))
-    vol_avg   = to_float(row.get("volume_avg_30d"))
-
-    # Derive change amount from price and change_pct
-    # price = ldcp * (1 + change_pct/100)  =>  ldcp = price / (1 + change_pct/100)
     if change_pct != 0:
         ldcp = price / (1 + change_pct / 100)
         change = price - ldcp
     else:
         ldcp = price
         change = 0.0
-
     return {
         "SYMBOL": sym,
-        "COMPANY": sym,  # psxdata doesn't return company name in quote
-        "SECTOR": sector_name(row.get("sector", "")),
+        "COMPANY": str(row.get("company") or sym),
+        "SECTOR": sector_name(row.get("sector","")),
         "LDCP": round(ldcp, 2),
-        "OPEN": price,   # not available — use price as proxy
+        "OPEN": price,
         "HIGH": price,
         "LOW": price,
         "CLOSE": price,
-        "VOLUME": to_int(vol_avg),
+        "VOLUME": to_int(row.get("volume_avg_30d")),
         "CHANGE": round(change, 2),
         "CHANGE%": change_pct,
-        "PE_RATIO": pe,
-        "DIVIDEND_YIELD": div_yield,
-        "LISTED_IN": str(row.get("listed_in", "")),
+        "PE_RATIO": to_float(row.get("pe_ratio")),
+        "DIVIDEND_YIELD": to_float(row.get("dividend_yield")),
     }
 
 TOP_STOCKS = [
-    "HBL","UBL","MCB","ABL","BAFL","BAHL","MEBL","SILK","JSBL",
+    "HBL","UBL","MCB","ABL","BAFL","BAHL","MEBL","JSBL",
     "OGDC","PPL","MARI","POL","PARCO",
     "ENGRO","EFERT","FATIMA","FFC","FFBL",
     "LUCK","DGKC","FCCL","KOHC","PIOC","CHCC",
     "HUBC","KAPCO","KEL","NCPL",
-    "PSO","APL","HASCOL","SHEL",
+    "PSO","APL","SHEL",
     "TRG","SYS","NETSOL","AVN","TPLP",
     "SEARL","ABOT","HINOON","GLAXO","FEROZ",
     "PSMC","INDU","HCAR","SAZEW",
@@ -87,36 +89,22 @@ TOP_STOCKS = [
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
-
-@app.get("/debug-quote")
-def debug_quote():
-    try:
-        df = psxdata.quote("HBL")
-        row = df.iloc[0].to_dict()
-        return {"columns": list(df.columns), "row": {k: str(v) for k,v in row.items()}}
-    except Exception as e:
-        return {"error": str(e)}
+    return {"status": "ok", "gemini": bool(GEMINI_KEY)}
 
 @app.get("/market-watch")
 def market_watch():
-    try:
-        result = []
-        for sym in TOP_STOCKS:
-            try:
-                df = psxdata.quote(sym)
-                stock = quote_to_stock(sym, df)
-                if stock and stock["CLOSE"] > 0:
-                    result.append(stock)
-            except:
-                continue
-        if not result:
-            raise HTTPException(status_code=500, detail="No data")
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = []
+    for sym in TOP_STOCKS:
+        try:
+            df = psxdata.quote(sym)
+            stock = quote_to_stock(sym, df)
+            if stock and stock["CLOSE"] > 0:
+                result.append(stock)
+        except:
+            continue
+    if not result:
+        raise HTTPException(status_code=500, detail="No data fetched")
+    return result
 
 @app.get("/quote/{symbol}")
 def quote_endpoint(symbol: str):
@@ -145,3 +133,70 @@ def history(symbol: str):
         return []
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+@app.post("/research")
+def research(body: dict):
+    """Generate AI research report using Gemini — runs on Railway, no CPU timeout"""
+    if not GEMINI_KEY:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not set in Railway environment")
+
+    symbol    = body.get("symbol", "UNKNOWN")
+    price     = body.get("price", 0)
+    change_pct = body.get("changePct", 0)
+    rsi       = body.get("rsi", "N/A")
+    pe        = body.get("pe", "N/A")
+
+    prompt = f"""You are a PSX (Pakistan Stock Exchange) equity analyst.
+Analyse {symbol} at Rs {price} ({change_pct}% today, RSI: {rsi}, P/E: {pe}).
+Pakistan market context: KSE-100, PKR currency.
+
+Reply ONLY with JSON (no markdown):
+{{"recommendation":"buy","confidence":65,"summary":"2-3 sentence summary.","technical_notes":"Technical note.","fundamental_notes":"Fundamental note.","news_impact":"Pakistan macro context.","bull_case":"Bull scenario.","bear_case":"Bear scenario.","entry_price":{price},"stop_loss":{round(price*0.95,2)},"target_1":{round(price*1.08,2)},"target_2":{round(price*1.15,2)},"risk_level":"medium"}}"""
+
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 600}
+    }).encode()
+
+    last_error = ""
+    for model in MODELS:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                clean = text.replace("```json","").replace("```","").strip()
+                report = json.loads(clean)
+                report["_model"] = model
+                return report
+        except urllib.error.HTTPError as e:
+            last_error = f"{model}: HTTP {e.code}"
+            if e.code in (429, 503):
+                continue  # try next model
+            break
+        except Exception as e:
+            last_error = f"{model}: {str(e)}"
+            continue
+
+    # All models failed — return basic report
+    return {
+        "recommendation": "hold",
+        "confidence": 45,
+        "summary": f"AI analysis temporarily unavailable for {symbol}. Please retry in a few minutes.",
+        "technical_notes": f"{symbol} at Rs {price}, change: {change_pct}%.",
+        "fundamental_notes": f"P/E: {pe}" if pe != "N/A" else "Data unavailable.",
+        "news_impact": "Pakistan market analysis unavailable.",
+        "bull_case": "Retry for full analysis.",
+        "bear_case": "Retry for full analysis.",
+        "entry_price": price,
+        "stop_loss": round(price * 0.95, 2),
+        "target_1": round(price * 1.08, 2),
+        "target_2": round(price * 1.15, 2),
+        "risk_level": "medium",
+        "_error": last_error,
+    }
