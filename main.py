@@ -3,11 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import psxdata
 import os
 import json
-import re
+import time
 import urllib.request
 import urllib.error
 
-app = FastAPI(title="PSX Data & AI API", version="2.1.0")
+app = FastAPI(title="PSX Data & AI API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,7 +17,8 @@ app.add_middleware(
 )
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
+# Only use models that work with your key
+MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
 def to_float(v):
     try: return float(v) if v is not None else 0.0
@@ -90,64 +91,88 @@ def extract_gemini_text(data):
         raise ValueError("No parts, finishReason: " + finish)
     return parts[0].get("text", "")
 
-def call_gemini(prompt):
+def call_gemini_single(model, prompt):
+    """Call one Gemini model. Returns text or raises."""
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.3, "maxOutputTokens": 800}
     }).encode()
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           + model + ":generateContent?key=" + GEMINI_KEY)
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        data = json.loads(resp.read())
+        return extract_gemini_text(data)
 
-    last_error = ""
-    for model in MODELS:
+def call_gemini(prompt):
+    """Try each model with retry on rate limit."""
+    for i, model in enumerate(MODELS):
         try:
-            url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-                   + model + ":generateContent?key=" + GEMINI_KEY)
-            req = urllib.request.Request(
-                url, data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                data = json.loads(resp.read())
-                text = extract_gemini_text(data)
-                if text:
-                    return text
-                last_error = model + ": empty text"
+            text = call_gemini_single(model, prompt)
+            if text:
+                print("Gemini success with model: " + model)
+                return text
         except urllib.error.HTTPError as e:
-            e.read()
-            last_error = model + ": HTTP " + str(e.code)
-            if e.code in (429, 503, 404):
+            body = e.read().decode()
+            print("Model " + model + " error: HTTP " + str(e.code))
+            if e.code == 429:
+                # Rate limited — wait and retry same model once
+                print("Rate limited, waiting 10s...")
+                time.sleep(10)
+                try:
+                    text = call_gemini_single(model, prompt)
+                    if text:
+                        return text
+                except:
+                    pass
+                # Try next model
+                continue
+            if e.code == 404:
                 continue
         except Exception as e:
-            last_error = model + ": " + str(e)
+            print("Model " + model + " exception: " + str(e))
             continue
-
-    raise ValueError("All models failed. Last: " + last_error)
+    raise ValueError("All Gemini models failed")
 
 def parse_json_from_text(text):
-    """Extract and parse JSON from Gemini response — handles markdown fences and extra text"""
-    # Remove markdown fences
+    """Extract JSON from Gemini response robustly."""
+    # Remove markdown
     text = text.replace("```json", "").replace("```", "").strip()
-    # Find the outermost JSON object
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except:
+        pass
+    # Find outermost JSON object
     start = text.find("{")
     end = text.rfind("}") + 1
     if start >= 0 and end > start:
-        candidate = text[start:end]
-        return json.loads(candidate)
-    raise ValueError("No JSON object found in response")
+        try:
+            return json.loads(text[start:end])
+        except:
+            pass
+    raise ValueError("No valid JSON found in: " + text[:200])
 
-def fallback_report(symbol, price, change_pct, rsi, pe):
+def fallback_report(symbol, price, change_pct, rsi, pe, reason=""):
     stop_loss = round(price * 0.95, 2)
     target_1  = round(price * 1.08, 2)
     target_2  = round(price * 1.15, 2)
+    msg = "Retry for full AI analysis."
+    if "429" in reason or "rate" in reason.lower():
+        msg = "Gemini is rate limited. Wait 1 minute and retry."
     return {
         "recommendation": "hold",
         "confidence": 45,
-        "summary": symbol + " is trading at Rs " + str(price) + " with " + str(change_pct) + "% change. Full AI analysis temporarily unavailable — please retry.",
+        "summary": symbol + " at Rs " + str(price) + " (" + str(change_pct) + "% today). " + msg,
         "technical_notes": "Price: Rs " + str(price) + " | Change: " + str(change_pct) + "% | RSI: " + str(rsi),
-        "fundamental_notes": "P/E ratio: " + str(pe),
-        "news_impact": "Pakistan market analysis unavailable. Please retry.",
-        "bull_case": "Retry for detailed bull case.",
-        "bear_case": "Retry for detailed bear case.",
+        "fundamental_notes": "P/E: " + str(pe),
+        "news_impact": "Pakistan market analysis temporarily unavailable.",
+        "bull_case": msg,
+        "bear_case": msg,
         "entry_price": price,
         "stop_loss": stop_loss,
         "target_1": target_1,
@@ -214,9 +239,8 @@ def history(symbol: str):
 
 @app.post("/research")
 def research(body: dict):
-    # Always return 200 — never 500 — so the app always shows something
     if not GEMINI_KEY:
-        return fallback_report("UNKNOWN", 0, 0, "N/A", "N/A")
+        return fallback_report("UNKNOWN", 0, 0, "N/A", "N/A", "No API key")
 
     symbol     = str(body.get("symbol", "UNKNOWN"))
     price      = float(body.get("price", 0))
@@ -230,20 +254,19 @@ def research(body: dict):
     prompt = (
         "You are a PSX (Pakistan Stock Exchange) equity analyst.\n"
         "Stock: " + symbol + "\n"
-        "Current price: Rs " + str(price) + "\n"
-        "Change today: " + str(change_pct) + "%\n"
+        "Price: Rs " + str(price) + "\n"
+        "Change: " + str(change_pct) + "%\n"
         "RSI-14: " + rsi + "\n"
-        "P/E ratio: " + pe + "\n"
-        "Market: KSE-100, Pakistan, PKR currency\n\n"
-        "IMPORTANT: Respond with ONLY a valid JSON object. No text before or after. No markdown fences.\n"
-        "Required JSON structure:\n"
+        "P/E: " + pe + "\n"
+        "Market: KSE-100, Pakistan, PKR\n\n"
+        "CRITICAL: Output ONLY valid JSON. Zero text before or after. No markdown.\n"
         '{"recommendation":"buy","confidence":70,'
-        '"summary":"Your 2-3 sentence summary here.",'
-        '"technical_notes":"Your technical analysis here.",'
-        '"fundamental_notes":"Your fundamental analysis here.",'
-        '"news_impact":"Pakistan macro and sector context here.",'
-        '"bull_case":"Your bull case scenario here.",'
-        '"bear_case":"Your bear case scenario here.",'
+        '"summary":"2-3 sentences about this stock.",'
+        '"technical_notes":"Technical analysis.",'
+        '"fundamental_notes":"Fundamental analysis.",'
+        '"news_impact":"Pakistan macro context.",'
+        '"bull_case":"Upside scenario.",'
+        '"bear_case":"Downside risk.",'
         '"entry_price":' + str(price) + ","
         '"stop_loss":' + str(stop_loss) + ","
         '"target_1":' + str(target_1) + ","
@@ -251,10 +274,10 @@ def research(body: dict):
         '"risk_level":"medium"}'
     )
 
+    reason = ""
     try:
         text = call_gemini(prompt)
         report = parse_json_from_text(text)
-        # Ensure required fields exist
         report.setdefault("recommendation", "hold")
         report.setdefault("confidence", 50)
         report.setdefault("entry_price", price)
@@ -264,6 +287,6 @@ def research(body: dict):
         report.setdefault("risk_level", "medium")
         return report
     except Exception as e:
-        # Log error but always return 200 with fallback
-        print("Research error:", str(e))
-        return fallback_report(symbol, price, change_pct, rsi, pe)
+        reason = str(e)
+        print("Research error: " + reason)
+        return fallback_report(symbol, price, change_pct, rsi, pe, reason)
