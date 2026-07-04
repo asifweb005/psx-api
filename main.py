@@ -3,11 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import psxdata
 import os
 import json
-import time
 import urllib.request
 import urllib.error
 
-app = FastAPI(title="PSX Data & AI API", version="2.2.0")
+app = FastAPI(title="PSX Data & AI API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,9 +15,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+GROQ_KEY   = os.environ.get("GROQ_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-# Only use models that work with your key
-MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+
+# Groq models — fast, free, generous limits
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+]
+
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
 def to_float(v):
     try: return float(v) if v is not None else 0.0
@@ -80,90 +87,106 @@ TOP_STOCKS = [
     "PAKT","LOTCHEM","ICI","SITC",
 ]
 
-def extract_gemini_text(data):
-    candidates = data.get("candidates", [])
-    if not candidates:
-        raise ValueError("No candidates")
-    content = candidates[0].get("content", {})
-    parts = content.get("parts", [])
-    if not parts:
-        finish = candidates[0].get("finishReason", "unknown")
-        raise ValueError("No parts, finishReason: " + finish)
-    return parts[0].get("text", "")
-
-def call_gemini_single(model, prompt):
-    """Call one Gemini model. Returns text or raises."""
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 800}
-    }).encode()
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           + model + ":generateContent?key=" + GEMINI_KEY)
+def http_post(url, payload, headers):
     req = urllib.request.Request(
-        url, data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
+        url, data=json.dumps(payload).encode(),
+        headers=headers, method="POST"
     )
     with urllib.request.urlopen(req, timeout=45) as resp:
-        data = json.loads(resp.read())
-        return extract_gemini_text(data)
+        return json.loads(resp.read())
 
-def call_gemini(prompt):
-    """Try each model with retry on rate limit."""
-    for i, model in enumerate(MODELS):
+def call_groq(prompt):
+    """Call Groq API — 30 req/min free, no quota issues."""
+    for model in GROQ_MODELS:
         try:
-            text = call_gemini_single(model, prompt)
-            if text:
-                print("Gemini success with model: " + model)
-                return text
+            data = http_post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                {
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a PSX equity analyst. Always respond with valid JSON only."
+                        },
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 800,
+                },
+                {
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer " + GROQ_KEY,
+                }
+            )
+            text = data["choices"][0]["message"]["content"]
+            print("Groq success: " + model)
+            return text
         except urllib.error.HTTPError as e:
             body = e.read().decode()
-            print("Model " + model + " error: HTTP " + str(e.code))
-            if e.code == 429:
-                # Rate limited — wait and retry same model once
-                print("Rate limited, waiting 10s...")
-                time.sleep(10)
-                try:
-                    text = call_gemini_single(model, prompt)
-                    if text:
-                        return text
-                except:
-                    pass
-                # Try next model
-                continue
-            if e.code == 404:
+            print("Groq " + model + " error: " + str(e.code) + " " + body[:100])
+            if e.code in (429, 503):
                 continue
         except Exception as e:
-            print("Model " + model + " exception: " + str(e))
+            print("Groq " + model + " exception: " + str(e))
+            continue
+    raise ValueError("All Groq models failed")
+
+def call_gemini(prompt):
+    """Fallback to Gemini if Groq fails."""
+    for model in GEMINI_MODELS:
+        try:
+            data = http_post(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                + model + ":generateContent?key=" + GEMINI_KEY,
+                {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 800}
+                },
+                {"Content-Type": "application/json"}
+            )
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    print("Gemini success: " + model)
+                    return parts[0].get("text", "")
+        except urllib.error.HTTPError as e:
+            e.read()
+            if e.code in (429, 503, 404):
+                continue
+        except Exception as e:
+            print("Gemini exception: " + str(e))
             continue
     raise ValueError("All Gemini models failed")
 
-def parse_json_from_text(text):
-    """Extract JSON from Gemini response robustly."""
-    # Remove markdown
-    text = text.replace("```json", "").replace("```", "").strip()
-    # Try direct parse first
+def call_ai(prompt):
+    """Try Groq first, fall back to Gemini."""
+    if GROQ_KEY:
+        try:
+            return call_groq(prompt)
+        except Exception as e:
+            print("Groq failed, trying Gemini: " + str(e))
+    if GEMINI_KEY:
+        return call_gemini(prompt)
+    raise ValueError("No AI key configured")
+
+def parse_json(text):
+    text = text.replace("```json","").replace("```","").strip()
     try:
         return json.loads(text)
     except:
         pass
-    # Find outermost JSON object
     start = text.find("{")
     end = text.rfind("}") + 1
     if start >= 0 and end > start:
-        try:
-            return json.loads(text[start:end])
-        except:
-            pass
-    raise ValueError("No valid JSON found in: " + text[:200])
+        return json.loads(text[start:end])
+    raise ValueError("No JSON in: " + text[:100])
 
 def fallback_report(symbol, price, change_pct, rsi, pe, reason=""):
     stop_loss = round(price * 0.95, 2)
     target_1  = round(price * 1.08, 2)
     target_2  = round(price * 1.15, 2)
-    msg = "Retry for full AI analysis."
-    if "429" in reason or "rate" in reason.lower():
-        msg = "Gemini is rate limited. Wait 1 minute and retry."
+    msg = "AI rate limited. Please retry in 1 minute." if "429" in reason else "Retry for full AI analysis."
     return {
         "recommendation": "hold",
         "confidence": 45,
@@ -180,16 +203,20 @@ def fallback_report(symbol, price, change_pct, rsi, pe, reason=""):
         "risk_level": "medium",
     }
 
+# ─── Routes ───────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "gemini": bool(GEMINI_KEY)}
+    return {
+        "status": "ok",
+        "groq": bool(GROQ_KEY),
+        "gemini": bool(GEMINI_KEY),
+    }
 
-@app.get("/test-gemini")
-def test_gemini():
-    if not GEMINI_KEY:
-        return {"error": "No key"}
+@app.get("/test-ai")
+def test_ai():
     try:
-        text = call_gemini("Say hello in one word only.")
+        text = call_ai("Say hello in one word only. Reply with just the word.")
         return {"success": True, "response": text.strip()}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -239,9 +266,6 @@ def history(symbol: str):
 
 @app.post("/research")
 def research(body: dict):
-    if not GEMINI_KEY:
-        return fallback_report("UNKNOWN", 0, 0, "N/A", "N/A", "No API key")
-
     symbol     = str(body.get("symbol", "UNKNOWN"))
     price      = float(body.get("price", 0))
     change_pct = float(body.get("changePct", 0))
@@ -258,15 +282,16 @@ def research(body: dict):
         "Change: " + str(change_pct) + "%\n"
         "RSI-14: " + rsi + "\n"
         "P/E: " + pe + "\n"
-        "Market: KSE-100, Pakistan, PKR\n\n"
-        "CRITICAL: Output ONLY valid JSON. Zero text before or after. No markdown.\n"
+        "Market: KSE-100, Pakistan, PKR currency\n\n"
+        "Output ONLY a JSON object. No text before or after. No markdown fences.\n"
+        "Use exactly this structure with your own analysis filling in the string values:\n"
         '{"recommendation":"buy","confidence":70,'
-        '"summary":"2-3 sentences about this stock.",'
-        '"technical_notes":"Technical analysis.",'
-        '"fundamental_notes":"Fundamental analysis.",'
-        '"news_impact":"Pakistan macro context.",'
-        '"bull_case":"Upside scenario.",'
-        '"bear_case":"Downside risk.",'
+        '"summary":"Your 2-3 sentence summary.",'
+        '"technical_notes":"Your technical analysis.",'
+        '"fundamental_notes":"Your fundamental analysis.",'
+        '"news_impact":"Pakistan macro and sector context.",'
+        '"bull_case":"Your bull case scenario.",'
+        '"bear_case":"Your bear case scenario.",'
         '"entry_price":' + str(price) + ","
         '"stop_loss":' + str(stop_loss) + ","
         '"target_1":' + str(target_1) + ","
@@ -274,10 +299,9 @@ def research(body: dict):
         '"risk_level":"medium"}'
     )
 
-    reason = ""
     try:
-        text = call_gemini(prompt)
-        report = parse_json_from_text(text)
+        text = call_ai(prompt)
+        report = parse_json(text)
         report.setdefault("recommendation", "hold")
         report.setdefault("confidence", 50)
         report.setdefault("entry_price", price)
@@ -287,6 +311,5 @@ def research(body: dict):
         report.setdefault("risk_level", "medium")
         return report
     except Exception as e:
-        reason = str(e)
-        print("Research error: " + reason)
-        return fallback_report(symbol, price, change_pct, rsi, pe, reason)
+        print("Research error: " + str(e))
+        return fallback_report(symbol, price, change_pct, rsi, pe, str(e))
