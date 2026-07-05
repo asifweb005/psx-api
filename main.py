@@ -3,10 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import psxdata
 import os
 import json
+import math
 import urllib.request
 import urllib.error
 
-app = FastAPI(title="PSX Data & AI API", version="4.0.0")
+app = FastAPI(title="PSX Data & AI API", version="4.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,20 +19,32 @@ app.add_middleware(
 GROQ_KEY   = os.environ.get("GROQ_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-]
-
+GROQ_MODELS   = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
-def to_float(v):
-    try: return float(v) if v is not None else 0.0
-    except: return 0.0
+def safe_float(v, default=0.0):
+    """Convert to float, returning default for None/nan/inf"""
+    try:
+        f = float(v) if v is not None else default
+        return default if (math.isnan(f) or math.isinf(f)) else f
+    except:
+        return default
 
-def to_int(v):
-    try: return int(str(v).replace(",","")) if v is not None else 0
-    except: return 0
+def safe_int(v, default=0):
+    try:
+        return int(str(v).replace(",","")) if v is not None else default
+    except:
+        return default
+
+def sanitize(obj):
+    """Recursively replace nan/inf in any dict or list"""
+    if isinstance(obj, dict):
+        return {k: sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize(v) for v in obj]
+    if isinstance(obj, float):
+        return 0.0 if (math.isnan(obj) or math.isinf(obj)) else obj
+    return obj
 
 SECTOR_NAMES = {
     "807":"Commercial Banks","806":"Insurance",
@@ -42,9 +55,7 @@ SECTOR_NAMES = {
     "805":"Chemical","832":"Tobacco","838":"Miscellaneous",
     "803":"Sugar & Allied","816":"Textile Composite",
     "817":"Textile Spinning","818":"Textile Weaving",
-    "825":"Vanaspati & Allied","826":"Paper & Board",
-    "827":"Engineering","830":"Glass & Ceramics",
-    "831":"Leatherware","833":"Transport",
+    "826":"Paper & Board","827":"Engineering",
 }
 
 def sector_name(code):
@@ -55,60 +66,60 @@ def quote_to_stock(sym, df):
     if df is None or len(df) == 0:
         return None
     row = df.iloc[0].to_dict()
-    price = to_float(row.get("price"))
-    change_pct = to_float(row.get("change_pct"))
+    price      = safe_float(row.get("price"))
+    change_pct = safe_float(row.get("change_pct"))
     if change_pct != 0:
-        ldcp = price / (1 + change_pct / 100)
+        ldcp   = price / (1 + change_pct / 100)
         change = price - ldcp
     else:
-        ldcp = price
+        ldcp   = price
         change = 0.0
     return {
-        "SYMBOL": sym,
-        "COMPANY": str(row.get("company") or sym),
-        "SECTOR": sector_name(row.get("sector","")),
-        "LDCP": round(ldcp, 2),
-        "OPEN": price, "HIGH": price, "LOW": price, "CLOSE": price,
-        "VOLUME": to_int(row.get("volume_avg_30d")),
-        "CHANGE": round(change, 2),
-        "CHANGE%": change_pct,
-        "PE_RATIO": to_float(row.get("pe_ratio")),
-        "DIVIDEND_YIELD": to_float(row.get("dividend_yield")),
-        "MARKET_CAP": to_float(row.get("market_cap")),
-        "LISTED_IN": str(row.get("listed_in") or ""),
+        "SYMBOL":        sym,
+        "COMPANY":       str(row.get("company") or sym),
+        "SECTOR":        sector_name(row.get("sector", "")),
+        "LDCP":          round(ldcp, 2),
+        "OPEN":          price,
+        "HIGH":          price,
+        "LOW":           price,
+        "CLOSE":         price,
+        "VOLUME":        safe_int(row.get("volume_avg_30d")),
+        "CHANGE":        round(change, 2),
+        "CHANGE%":       change_pct,
+        "PE_RATIO":      safe_float(row.get("pe_ratio")),
+        "DIVIDEND_YIELD":safe_float(row.get("dividend_yield")),
+        "MARKET_CAP":    safe_float(row.get("market_cap")),
+        "LISTED_IN":     str(row.get("listed_in") or ""),
     }
 
-# All major PSX stocks — expanded list
 TOP_STOCKS = [
     # Banks
-    "HBL","UBL","MCB","ABL","BAFL","BAHL","MEBL","JSBL","SILK","NBP",
-    "AKBL","BIFO","SNBL","BOP","FAYSAL","SCBPL","KASBB","SMBL","PIBTL",
+    "HBL","UBL","MCB","ABL","BAFL","BAHL","MEBL","JSBL","NBP",
+    "AKBL","SNBL","BOP","FAYSAL","SCBPL","PIBTL",
     # Oil & Gas
-    "OGDC","PPL","MARI","POL","PARCO","PSO","APL","SHEL","HASCOL","BYCO",
-    "SNGP","SSGC","PKGS","TOTL",
+    "OGDC","PPL","MARI","POL","PSO","APL","SHEL",
+    "SNGP","SSGC","PARCO","BYCO","HASCOL",
     # Fertilizer
-    "ENGRO","EFERT","FATIMA","FFC","FFBL","ACPL",
+    "ENGRO","EFERT","FATIMA","FFC","FFBL",
     # Cement
-    "LUCK","DGKC","FCCL","KOHC","PIOC","CHCC","MLCF","GWLC","FLYNG",
-    "BWCL","JVDC","SKMT","THCCL","POWER","ARPL",
+    "LUCK","DGKC","FCCL","KOHC","PIOC","CHCC","MLCF","GWLC",
+    "BWCL","JVDC","SKMT","THCCL","FLYNG",
     # Power
-    "HUBC","KAPCO","KEL","NCPL","PKGP","JPGL","LPCL","NPKC","TSPL",
-    "ATRL","IGAS","RLNG","SRVI",
+    "HUBC","KAPCO","KEL","NCPL","PKGP","JPGL","LPCL","TSPL","ATRL",
     # Technology
-    "TRG","SYS","NETSOL","AVN","TPLP","PSEL","HUMNL","MTMM",
+    "TRG","SYS","NETSOL","AVN","TPLP","PSEL","HUMNL",
     # Pharma
-    "SEARL","ABOT","HINOON","GLAXO","FEROZ","SAPL","COLG","AGP",
+    "SEARL","ABOT","HINOON","GLAXO","FEROZ","SAPL","AGP",
     # Auto
-    "PSMC","INDU","HCAR","SAZEW","GHNL","GHNI","MTL","ATLH",
+    "PSMC","INDU","HCAR","SAZEW","MTL","ATLH","GHNL",
     # Food
-    "NESTLE","UNITY","TREET","QUICE","BHAT","FDISL","SFML",
+    "NESTLE","UNITY","TREET","QUICE","SFML",
     # Textile
-    "GATM","NCL","CLOV","KTML","NML","RCML","THAL","ADMM",
+    "NCL","KTML","NML","RCML","THAL","ADMM","GATM",
     # Chemical
-    "LOTCHEM","ICI","SITC","EPCL","GTYR","SIEM","AKZO",
+    "LOTCHEM","ICI","SITC","EPCL","GTYR","AKZO",
     # Misc
-    "PAKT","ISIL","PNSC","ASTL","ISL","MUGHAL","AICL","JLICL",
-    "EFUG","DAWH","DWOOD","ENGROS","SHFA","PKOL","GGGL",
+    "PAKT","ISIL","PNSC","ASTL","ISL","MUGHAL","DAWH","SHFA",
 ]
 
 def http_post(url, payload, headers):
@@ -130,21 +141,16 @@ def call_groq(prompt):
                         {"role": "system", "content": "You are a PSX equity analyst. Respond with valid JSON only."},
                         {"role": "user", "content": prompt}
                     ],
-                    "temperature": 0.3,
-                    "max_tokens": 1000,
+                    "temperature": 0.3, "max_tokens": 1000,
                 },
                 {"Content-Type": "application/json", "Authorization": "Bearer " + GROQ_KEY}
             )
-            text = data["choices"][0]["message"]["content"]
-            print("Groq success: " + model)
-            return text
+            return data["choices"][0]["message"]["content"]
         except urllib.error.HTTPError as e:
-            body = e.read().decode()
-            print("Groq " + model + ": " + str(e.code) + " " + body[:100])
-            if e.code in (429, 503):
-                continue
+            e.read()
+            if e.code in (429, 503): continue
         except Exception as e:
-            print("Groq exception: " + str(e))
+            print("Groq " + model + ": " + str(e))
             continue
     raise ValueError("All Groq models failed")
 
@@ -167,7 +173,7 @@ def call_gemini(prompt):
             e.read()
             if e.code in (429, 503, 404): continue
         except Exception as e:
-            print("Gemini exception: " + str(e))
+            print("Gemini: " + str(e))
             continue
     raise ValueError("All Gemini models failed")
 
@@ -183,10 +189,10 @@ def parse_json(text):
     text = text.replace("```json","").replace("```","").strip()
     try: return json.loads(text)
     except: pass
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    if start >= 0 and end > start:
-        return json.loads(text[start:end])
+    s = text.find("{")
+    e = text.rfind("}") + 1
+    if s >= 0 and e > s:
+        return json.loads(text[s:e])
     raise ValueError("No JSON found")
 
 def fallback_report(symbol, price, change_pct, rsi, pe, reason=""):
@@ -221,7 +227,6 @@ def test_ai():
 
 @app.get("/symbols")
 def symbols():
-    """All available stock symbols"""
     return {"symbols": TOP_STOCKS, "count": len(TOP_STOCKS)}
 
 @app.get("/market-watch")
@@ -232,7 +237,7 @@ def market_watch():
             df = psxdata.quote(sym)
             stock = quote_to_stock(sym, df)
             if stock and stock["CLOSE"] > 0:
-                result.append(stock)
+                result.append(sanitize(stock))  # sanitize nan before JSON
         except:
             continue
     if not result:
@@ -246,7 +251,7 @@ def quote_endpoint(symbol: str):
         stock = quote_to_stock(symbol.upper(), df)
         if not stock:
             raise HTTPException(status_code=404, detail="Not found")
-        return stock
+        return sanitize(stock)
     except HTTPException:
         raise
     except Exception as e:
@@ -256,48 +261,23 @@ def quote_endpoint(symbol: str):
 def history(symbol: str, days: int = 365):
     try:
         from datetime import datetime, timedelta
-        end = datetime.today().strftime("%Y-%m-%d")
+        end   = datetime.today().strftime("%Y-%m-%d")
         start = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
         df = psxdata.stocks(symbol.upper(), start=start, end=end)
         if hasattr(df, "reset_index"):
             records = df.reset_index().to_dict(orient="records")
-            return [{str(k): (v.isoformat() if hasattr(v,"isoformat") else v)
-                     for k,v in r.items()} for r in records]
+            clean = [{str(k): (v.isoformat() if hasattr(v,"isoformat") else v)
+                      for k,v in r.items()} for r in records]
+            return sanitize(clean)
         return []
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-@app.get("/financials/{symbol}")
-def financials(symbol: str):
-    """Fetch financial statements from PSX for quarterly comparison"""
-    try:
-        import urllib.request
-        url = "https://dps.psx.com.pk/financials/" + symbol.upper()
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json",
-                "X-Requested-With": "XMLHttpRequest",
-            }
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-            return data
-    except Exception as e:
-        # Return empty structure — financials not always available
-        return {
-            "symbol": symbol.upper(),
-            "quarterly": [],
-            "annual": [],
-            "error": str(e)
-        }
-
 @app.post("/research")
 def research(body: dict):
     symbol     = str(body.get("symbol", "UNKNOWN"))
-    price      = float(body.get("price", 0))
-    change_pct = float(body.get("changePct", 0))
+    price      = safe_float(body.get("price", 0))
+    change_pct = safe_float(body.get("changePct", 0))
     rsi        = str(body.get("rsi", "N/A"))
     pe         = str(body.get("pe", "N/A"))
     div_yield  = str(body.get("divYield", "N/A"))
@@ -307,37 +287,29 @@ def research(body: dict):
     target_2   = round(price * 1.15, 2)
 
     prompt = (
-        "You are a senior PSX (Pakistan Stock Exchange) equity research analyst.\n"
-        "Write an institutional-style research report for:\n\n"
-        "Stock: " + symbol + "\n"
-        "Sector: " + sector + "\n"
-        "Current Price: Rs " + str(price) + "\n"
-        "Change Today: " + str(change_pct) + "%\n"
-        "RSI-14: " + rsi + "\n"
-        "P/E Ratio: " + pe + "\n"
-        "Dividend Yield: " + div_yield + "%\n"
-        "Market: KSE-100, Pakistan Stock Exchange, PKR currency\n\n"
-        "Consider Pakistan's current economic context: interest rates, inflation, PKR stability, sector dynamics.\n"
-        "Note: Today is July 2026. Base your analysis on general knowledge of this company and sector.\n\n"
-        "Output ONLY a valid JSON object with these exact keys:\n"
-        '{"recommendation":"strong_buy or buy or hold or sell or strong_sell",'
-        '"confidence":75,'
-        '"summary":"3-4 sentence executive summary with specific insights about ' + symbol + '.",'
-        '"technical_notes":"Detailed technical analysis: price action, RSI interpretation, support/resistance levels.",'
-        '"fundamental_notes":"Fundamental analysis: P/E valuation, dividend yield, sector position, balance sheet health.",'
-        '"news_impact":"Pakistan macro factors: interest rate impact, PKR effect, sector-specific news and outlook for ' + sector + '.",'
-        '"bull_case":"3 specific reasons to be bullish on ' + symbol + '.",'
-        '"bear_case":"3 specific risks and reasons to be bearish on ' + symbol + '.",'
+        "You are a senior PSX equity research analyst.\n"
+        "Stock: " + symbol + " | Sector: " + sector + "\n"
+        "Price: Rs " + str(price) + " | Change: " + str(change_pct) + "%\n"
+        "RSI-14: " + rsi + " | P/E: " + pe + " | Div Yield: " + div_yield + "%\n"
+        "Market: KSE-100, Pakistan, PKR. Date: July 2026.\n\n"
+        "Output ONLY valid JSON. No text before or after:\n"
+        '{"recommendation":"buy","confidence":70,'
+        '"summary":"3-4 sentence executive summary with specific insights.",'
+        '"technical_notes":"Detailed technical analysis: RSI interpretation, price action, key levels.",'
+        '"fundamental_notes":"P/E valuation analysis, dividend yield assessment, sector position.",'
+        '"news_impact":"Pakistan macro factors: interest rates, PKR, inflation, sector outlook.",'
+        '"bull_case":"3 specific bullish catalysts for ' + symbol + '.",'
+        '"bear_case":"3 specific risks and bearish scenarios.",'
         '"entry_price":' + str(price) + ","
         '"stop_loss":' + str(stop_loss) + ","
         '"target_1":' + str(target_1) + ","
         '"target_2":' + str(target_2) + ","
         '"holding_period":"3-6 months",'
-        '"risk_level":"low or medium or high"}'
+        '"risk_level":"medium"}'
     )
 
     try:
-        text = call_ai(prompt)
+        text   = call_ai(prompt)
         report = parse_json(text)
         report.setdefault("recommendation", "hold")
         report.setdefault("confidence", 50)
@@ -346,7 +318,7 @@ def research(body: dict):
         report.setdefault("target_1", target_1)
         report.setdefault("target_2", target_2)
         report.setdefault("risk_level", "medium")
-        return report
+        return sanitize(report)
     except Exception as e:
         print("Research error: " + str(e))
         return fallback_report(symbol, price, change_pct, rsi, pe, str(e))
