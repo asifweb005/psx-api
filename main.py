@@ -6,8 +6,9 @@ import json
 import math
 import urllib.request
 import urllib.error
+from datetime import datetime, timedelta
 
-app = FastAPI(title="PSX Data & AI API", version="4.1.0")
+app = FastAPI(title="PSX Data & AI API", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,7 +24,6 @@ GROQ_MODELS   = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
 def safe_float(v, default=0.0):
-    """Convert to float, returning default for None/nan/inf"""
     try:
         f = float(v) if v is not None else default
         return default if (math.isnan(f) or math.isinf(f)) else f
@@ -37,7 +37,6 @@ def safe_int(v, default=0):
         return default
 
 def sanitize(obj):
-    """Recursively replace nan/inf in any dict or list"""
     if isinstance(obj, dict):
         return {k: sanitize(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -56,16 +55,41 @@ SECTOR_NAMES = {
     "803":"Sugar & Allied","816":"Textile Composite",
     "817":"Textile Spinning","818":"Textile Weaving",
     "826":"Paper & Board","827":"Engineering",
+    "808":"Engineering","813":"Leatherware",
+    "825":"Refinery","829":"Textile","830":"Glass & Ceramics",
+    "833":"Transport","802":"Automobile Parts",
 }
 
 def sector_name(code):
     key = str(code).replace(".0","").strip()
     return SECTOR_NAMES.get(key, key)
 
+def get_today_ohlcv(symbol):
+    """Get today's OHLCV from the most recent history record"""
+    try:
+        today = datetime.today()
+        # Go back 7 days to account for weekends/holidays
+        start = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        end   = today.strftime("%Y-%m-%d")
+        df = psxdata.stocks(symbol.upper(), start=start, end=end)
+        if df is None or len(df) == 0:
+            return None
+        # Get the most recent row
+        row = df.iloc[-1].to_dict()
+        return {
+            "open":   safe_float(row.get("Open") or row.get("open")),
+            "high":   safe_float(row.get("High") or row.get("high")),
+            "low":    safe_float(row.get("Low")  or row.get("low")),
+            "close":  safe_float(row.get("Close") or row.get("close")),
+            "volume": safe_int(row.get("Volume") or row.get("volume")),
+        }
+    except:
+        return None
+
 def quote_to_stock(sym, df):
     if df is None or len(df) == 0:
         return None
-    row = df.iloc[0].to_dict()
+    row        = df.iloc[0].to_dict()
     price      = safe_float(row.get("price"))
     change_pct = safe_float(row.get("change_pct"))
     if change_pct != 0:
@@ -74,23 +98,27 @@ def quote_to_stock(sym, df):
     else:
         ldcp   = price
         change = 0.0
-    return {
-        "SYMBOL":        sym,
-        "COMPANY":       str(row.get("company") or sym),
-        "SECTOR":        sector_name(row.get("sector", "")),
-        "LDCP":          round(ldcp, 2),
-        "OPEN":          price,
-        "HIGH":          price,
-        "LOW":           price,
-        "CLOSE":         price,
-        "VOLUME":        safe_int(row.get("volume_avg_30d")),
-        "CHANGE":        round(change, 2),
-        "CHANGE%":       change_pct,
-        "PE_RATIO":      safe_float(row.get("pe_ratio")),
-        "DIVIDEND_YIELD":safe_float(row.get("dividend_yield")),
-        "MARKET_CAP":    safe_float(row.get("market_cap")),
-        "LISTED_IN":     str(row.get("listed_in") or ""),
-    }
+
+    # Try to get real OHLCV from history
+    ohlcv = get_today_ohlcv(sym)
+
+    return sanitize({
+        "SYMBOL":         sym,
+        "COMPANY":        str(row.get("company") or sym),
+        "SECTOR":         sector_name(row.get("sector", "")),
+        "LDCP":           round(ldcp, 2),
+        "OPEN":           ohlcv["open"]   if ohlcv and ohlcv["open"]   > 0 else price,
+        "HIGH":           ohlcv["high"]   if ohlcv and ohlcv["high"]   > 0 else price,
+        "LOW":            ohlcv["low"]    if ohlcv and ohlcv["low"]    > 0 else price,
+        "CLOSE":          price,
+        "VOLUME":         ohlcv["volume"] if ohlcv else safe_int(row.get("volume_avg_30d")),
+        "CHANGE":         round(change, 2),
+        "CHANGE%":        change_pct,
+        "PE_RATIO":       safe_float(row.get("pe_ratio")),
+        "DIVIDEND_YIELD": safe_float(row.get("dividend_yield")),
+        "MARKET_CAP":     safe_float(row.get("market_cap")),
+        "LISTED_IN":      str(row.get("listed_in") or ""),
+    })
 
 TOP_STOCKS = [
     # Banks
@@ -98,28 +126,28 @@ TOP_STOCKS = [
     "AKBL","SNBL","BOP","FAYSAL","SCBPL","PIBTL",
     # Oil & Gas
     "OGDC","PPL","MARI","POL","PSO","APL","SHEL",
-    "SNGP","SSGC","PARCO","BYCO","HASCOL",
+    "SNGP","SSGC","PARCO","BYCO","HASCOL","ATRL",
     # Fertilizer
     "ENGRO","EFERT","FATIMA","FFC","FFBL",
     # Cement
     "LUCK","DGKC","FCCL","KOHC","PIOC","CHCC","MLCF","GWLC",
-    "BWCL","JVDC","SKMT","THCCL","FLYNG",
+    "BWCL","JVDC","THCCL","FLYNG","LPCL",
     # Power
-    "HUBC","KAPCO","KEL","NCPL","PKGP","JPGL","LPCL","TSPL","ATRL",
+    "HUBC","KAPCO","KEL","NCPL","PKGP","JPGL","TSPL",
     # Technology
     "TRG","SYS","NETSOL","AVN","TPLP","PSEL","HUMNL",
     # Pharma
     "SEARL","ABOT","HINOON","GLAXO","FEROZ","SAPL","AGP",
     # Auto
-    "PSMC","INDU","HCAR","SAZEW","MTL","ATLH","GHNL",
+    "PSMC","INDU","HCAR","SAZEW","MTL","GHNL",
     # Food
-    "NESTLE","UNITY","TREET","QUICE","SFML",
+    "NESTLE","UNITY","TREET","QUICE","ISIL",
     # Textile
-    "NCL","KTML","NML","RCML","THAL","ADMM","GATM",
+    "NCL","KTML","NML","RCML","ADMM","GATM","SHFA",
     # Chemical
     "LOTCHEM","ICI","SITC","EPCL","GTYR","AKZO",
     # Misc
-    "PAKT","ISIL","PNSC","ASTL","ISL","MUGHAL","DAWH","SHFA",
+    "PAKT","PNSC","ASTL","ISL","MUGHAL","DAWH",
 ]
 
 def http_post(url, payload, headers):
@@ -211,8 +239,6 @@ def fallback_report(symbol, price, change_pct, rsi, pe, reason=""):
         "target_1": target_1, "target_2": target_2, "risk_level": "medium",
     }
 
-# ─── Routes ─────────────────────────────────────────────────
-
 @app.get("/health")
 def health():
     return {"status":"ok","groq":bool(GROQ_KEY),"gemini":bool(GEMINI_KEY)}
@@ -237,7 +263,7 @@ def market_watch():
             df = psxdata.quote(sym)
             stock = quote_to_stock(sym, df)
             if stock and stock["CLOSE"] > 0:
-                result.append(sanitize(stock))  # sanitize nan before JSON
+                result.append(stock)
         except:
             continue
     if not result:
@@ -251,7 +277,7 @@ def quote_endpoint(symbol: str):
         stock = quote_to_stock(symbol.upper(), df)
         if not stock:
             raise HTTPException(status_code=404, detail="Not found")
-        return sanitize(stock)
+        return stock
     except HTTPException:
         raise
     except Exception as e:
@@ -260,7 +286,6 @@ def quote_endpoint(symbol: str):
 @app.get("/history/{symbol}")
 def history(symbol: str, days: int = 365):
     try:
-        from datetime import datetime, timedelta
         end   = datetime.today().strftime("%Y-%m-%d")
         start = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
         df = psxdata.stocks(symbol.upper(), start=start, end=end)
@@ -295,9 +320,9 @@ def research(body: dict):
         "Output ONLY valid JSON. No text before or after:\n"
         '{"recommendation":"buy","confidence":70,'
         '"summary":"3-4 sentence executive summary with specific insights.",'
-        '"technical_notes":"Detailed technical analysis: RSI interpretation, price action, key levels.",'
-        '"fundamental_notes":"P/E valuation analysis, dividend yield assessment, sector position.",'
-        '"news_impact":"Pakistan macro factors: interest rates, PKR, inflation, sector outlook.",'
+        '"technical_notes":"RSI interpretation, price action, key support/resistance.",'
+        '"fundamental_notes":"P/E valuation, dividend yield, sector position.",'
+        '"news_impact":"Pakistan macro: interest rates, PKR, inflation, sector outlook.",'
         '"bull_case":"3 specific bullish catalysts for ' + symbol + '.",'
         '"bear_case":"3 specific risks and bearish scenarios.",'
         '"entry_price":' + str(price) + ","
