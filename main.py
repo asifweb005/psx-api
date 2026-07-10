@@ -8,7 +8,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
 
-app = FastAPI(title="PSX Data & AI API", version="5.1.0")
+app = FastAPI(title="PSX Data & AI API", version="5.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,10 +64,54 @@ def sector_name(code):
     key = str(code).replace(".0","").strip()
     return SECTOR_NAMES.get(key, key)
 
-def quote_row_to_stock(sym, row, include_ohlcv=False):
-    """Convert a psxdata quote row to our standard format.
-    include_ohlcv=True fetches real OHLCV from history (slow, only for detail view).
+PSX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+    "Referer": "https://dps.psx.com.pk/",
+}
+
+def fetch_psx_timeseries(symbol, limit=365):
     """
+    Fetch from dps.psx.com.pk/timeseries/eod/{symbol}
+    Returns list of [timestamp, close, volume, open]
+    Sorted newest first.
+    """
+    url = "https://dps.psx.com.pk/timeseries/eod/" + symbol.upper()
+    req = urllib.request.Request(url, headers=PSX_HEADERS)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = json.loads(resp.read())
+    # Response: {'status':1, 'data': [[ts, close, volume, open], ...]}
+    if isinstance(raw, dict):
+        data = raw.get("data", [])
+    else:
+        data = raw
+    # Each item: [timestamp_seconds, close, volume, open]
+    # Take up to limit items (already newest-first from PSX)
+    return data[:limit]
+
+def timeseries_to_candles(data):
+    """Convert PSX timeseries array to candle dicts, oldest-first for charting."""
+    candles = []
+    for item in reversed(data):  # reverse to oldest-first
+        if not isinstance(item, (list, tuple)) or len(item) < 4:
+            continue
+        ts    = int(item[0])
+        close = safe_float(item[1])
+        vol   = safe_int(item[2])
+        open_ = safe_float(item[3])
+        if close <= 0:
+            continue
+        candles.append({
+            "date":   datetime.fromtimestamp(ts).strftime("%Y-%m-%d"),
+            "open":   open_,
+            "high":   max(open_, close),   # PSX EOD doesn't include H/L separately
+            "low":    min(open_, close),
+            "close":  close,
+            "volume": vol,
+        })
+    return candles
+
+def quote_row_to_stock(sym, row):
     price      = safe_float(row.get("price"))
     change_pct = safe_float(row.get("change_pct"))
     if change_pct != 0:
@@ -76,36 +120,16 @@ def quote_row_to_stock(sym, row, include_ohlcv=False):
     else:
         ldcp   = price
         change = 0.0
-
-    open_  = price
-    high   = price
-    low    = price
-    volume = safe_int(row.get("volume_avg_30d"))
-
-    if include_ohlcv:
-        try:
-            end   = datetime.today().strftime("%Y-%m-%d")
-            start = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
-            df = psxdata.stocks(sym, start=start, end=end)
-            if df is not None and len(df) > 0:
-                last = df.iloc[-1].to_dict()
-                open_  = safe_float(last.get("Open")   or last.get("open"),   price)
-                high   = safe_float(last.get("High")   or last.get("high"),   price)
-                low    = safe_float(last.get("Low")    or last.get("low"),    price)
-                volume = safe_int(  last.get("Volume") or last.get("volume"))
-        except:
-            pass
-
     return sanitize({
         "SYMBOL":         sym,
         "COMPANY":        str(row.get("company") or sym),
         "SECTOR":         sector_name(row.get("sector", "")),
         "LDCP":           round(ldcp, 2),
-        "OPEN":           open_,
-        "HIGH":           high,
-        "LOW":            low,
+        "OPEN":           price,
+        "HIGH":           price,
+        "LOW":            price,
         "CLOSE":          price,
-        "VOLUME":         volume,
+        "VOLUME":         safe_int(row.get("volume_avg_30d")),
         "CHANGE":         round(change, 2),
         "CHANGE%":        change_pct,
         "PE_RATIO":       safe_float(row.get("pe_ratio")),
@@ -241,19 +265,17 @@ def symbols():
 
 @app.get("/market-watch")
 def market_watch():
-    """Fast — no OHLCV fetch per stock, just price+change"""
     result = []
     for sym in TOP_STOCKS:
         try:
             df = psxdata.quote(sym)
             if df is None or len(df) == 0:
                 continue
-            row = df.iloc[0].to_dict()
+            row   = df.iloc[0].to_dict()
             price = safe_float(row.get("price"))
             if price <= 0:
                 continue
-            stock = quote_row_to_stock(sym, row, include_ohlcv=False)
-            result.append(stock)
+            result.append(quote_row_to_stock(sym, row))
         except:
             continue
     if not result:
@@ -262,13 +284,40 @@ def market_watch():
 
 @app.get("/quote/{symbol}")
 def quote_endpoint(symbol: str):
-    """Detailed quote WITH real OHLCV — used by stock detail screen"""
+    """
+    Returns quote + today's OHLCV from PSX timeseries.
+    Format: [timestamp, close, volume, open] newest-first.
+    """
     try:
-        df = psxdata.quote(symbol.upper())
+        sym = symbol.upper()
+        # Base quote
+        df = psxdata.quote(sym)
         if df is None or len(df) == 0:
             raise HTTPException(status_code=404, detail="Not found")
         row   = df.iloc[0].to_dict()
-        stock = quote_row_to_stock(symbol.upper(), row, include_ohlcv=True)
+        stock = quote_row_to_stock(sym, row)
+
+        # Enrich with today's OHLCV from timeseries
+        try:
+            ts_data = fetch_psx_timeseries(sym, limit=1)
+            if ts_data and len(ts_data) > 0:
+                latest = ts_data[0]  # newest first
+                # [timestamp, close, volume, open]
+                if isinstance(latest, (list, tuple)) and len(latest) >= 4:
+                    open_  = safe_float(latest[3])
+                    close  = safe_float(latest[1])
+                    vol    = safe_int(latest[2])
+                    high   = max(open_, close)
+                    low    = min(open_, close)
+                    if open_ > 0:
+                        stock["OPEN"]   = open_
+                        stock["HIGH"]   = high
+                        stock["LOW"]    = low
+                        stock["VOLUME"] = vol
+        except Exception as e:
+            print("OHLCV enrich failed: " + str(e))
+            # Keep defaults from psxdata.quote()
+
         return stock
     except HTTPException:
         raise
@@ -277,17 +326,28 @@ def quote_endpoint(symbol: str):
 
 @app.get("/history/{symbol}")
 def history(symbol: str, days: int = 365):
+    """
+    Returns OHLCV candles from PSX timeseries endpoint.
+    Oldest-first for charting.
+    """
     try:
-        end   = datetime.today().strftime("%Y-%m-%d")
-        start = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
-        df = psxdata.stocks(symbol.upper(), start=start, end=end)
-        if hasattr(df, "reset_index"):
-            records = df.reset_index().to_dict(orient="records")
-            clean = [{str(k): (v.isoformat() if hasattr(v,"isoformat") else v)
-                      for k,v in r.items()} for r in records]
-            return sanitize(clean)
-        return []
+        sym     = symbol.upper()
+        ts_data = fetch_psx_timeseries(sym, limit=days)
+        candles = timeseries_to_candles(ts_data)
+        return sanitize(candles)
     except Exception as e:
+        # Fallback to psxdata if PSX timeseries fails
+        try:
+            end   = datetime.today().strftime("%Y-%m-%d")
+            start = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+            df    = psxdata.stocks(symbol.upper(), start=start, end=end)
+            if hasattr(df, "reset_index"):
+                records = df.reset_index().to_dict(orient="records")
+                clean = [{str(k): (v.isoformat() if hasattr(v,"isoformat") else v)
+                          for k,v in r.items()} for r in records]
+                return sanitize(clean)
+        except:
+            pass
         raise HTTPException(status_code=404, detail=str(e))
 
 @app.post("/research")
@@ -339,28 +399,3 @@ def research(body: dict):
     except Exception as e:
         print("Research error: " + str(e))
         return fallback_report(symbol, price, change_pct, rsi, pe, str(e))
-
-# This won't actually append - need to add debug endpoint to existing file
-
-@app.get("/debug-history/{symbol}")
-def debug_history(symbol: str):
-    """Test PSX timeseries endpoint directly"""
-    try:
-        url = "https://dps.psx.com.pk/timeseries/eod/" + symbol.upper()
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Referer": "https://dps.psx.com.pk/",
-        })
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-            if isinstance(data, list) and len(data) > 0:
-                return {
-                    "success": True,
-                    "count": len(data),
-                    "sample_keys": list(data[0].keys()) if isinstance(data[0], dict) else str(data[0]),
-                    "last_record": data[-1] if isinstance(data[-1], dict) else str(data[-1])
-                }
-            return {"success": True, "data": str(data)[:500]}
-    except Exception as e:
-        return {"error": str(e)}
