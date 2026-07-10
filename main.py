@@ -339,3 +339,24 @@ def research(body: dict):
     except Exception as e:
         print("Research error: " + str(e))
         return fallback_report(symbol, price, change_pct, rsi, pe, str(e))
+
+# This won't actually append - need to add debug endpoint to existing file
+
+@app.get("/debug-history/{symbol}")
+def debug_history(symbol: str):
+    """Shows exact column names from psxdata.stocks()"""
+    try:
+        end   = datetime.today().strftime("%Y-%m-%d")
+        start = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+        df = psxdata.stocks(symbol.upper(), start=start, end=end)
+        if df is None or len(df) == 0:
+            return {"error": "No data", "symbol": symbol}
+        df_reset = df.reset_index()
+        last_row = df_reset.iloc[-1].to_dict()
+        return {
+            "columns": list(df_reset.columns),
+            "last_row": {str(k): str(v) for k, v in last_row.items()},
+            "row_count": len(df)
+        }
+    except Exception as e:
+        return {"error": str(e)}
