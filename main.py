@@ -8,7 +8,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
 
-app = FastAPI(title="PSX Data & AI API", version="5.0.0")
+app = FastAPI(title="PSX Data & AI API", version="5.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,32 +64,10 @@ def sector_name(code):
     key = str(code).replace(".0","").strip()
     return SECTOR_NAMES.get(key, key)
 
-def get_today_ohlcv(symbol):
-    """Get today's OHLCV from the most recent history record"""
-    try:
-        today = datetime.today()
-        # Go back 7 days to account for weekends/holidays
-        start = (today - timedelta(days=7)).strftime("%Y-%m-%d")
-        end   = today.strftime("%Y-%m-%d")
-        df = psxdata.stocks(symbol.upper(), start=start, end=end)
-        if df is None or len(df) == 0:
-            return None
-        # Get the most recent row
-        row = df.iloc[-1].to_dict()
-        return {
-            "open":   safe_float(row.get("Open") or row.get("open")),
-            "high":   safe_float(row.get("High") or row.get("high")),
-            "low":    safe_float(row.get("Low")  or row.get("low")),
-            "close":  safe_float(row.get("Close") or row.get("close")),
-            "volume": safe_int(row.get("Volume") or row.get("volume")),
-        }
-    except:
-        return None
-
-def quote_to_stock(sym, df):
-    if df is None or len(df) == 0:
-        return None
-    row        = df.iloc[0].to_dict()
+def quote_row_to_stock(sym, row, include_ohlcv=False):
+    """Convert a psxdata quote row to our standard format.
+    include_ohlcv=True fetches real OHLCV from history (slow, only for detail view).
+    """
     price      = safe_float(row.get("price"))
     change_pct = safe_float(row.get("change_pct"))
     if change_pct != 0:
@@ -99,19 +77,35 @@ def quote_to_stock(sym, df):
         ldcp   = price
         change = 0.0
 
-    # Try to get real OHLCV from history
-    ohlcv = get_today_ohlcv(sym)
+    open_  = price
+    high   = price
+    low    = price
+    volume = safe_int(row.get("volume_avg_30d"))
+
+    if include_ohlcv:
+        try:
+            end   = datetime.today().strftime("%Y-%m-%d")
+            start = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+            df = psxdata.stocks(sym, start=start, end=end)
+            if df is not None and len(df) > 0:
+                last = df.iloc[-1].to_dict()
+                open_  = safe_float(last.get("Open")   or last.get("open"),   price)
+                high   = safe_float(last.get("High")   or last.get("high"),   price)
+                low    = safe_float(last.get("Low")    or last.get("low"),    price)
+                volume = safe_int(  last.get("Volume") or last.get("volume"))
+        except:
+            pass
 
     return sanitize({
         "SYMBOL":         sym,
         "COMPANY":        str(row.get("company") or sym),
         "SECTOR":         sector_name(row.get("sector", "")),
         "LDCP":           round(ldcp, 2),
-        "OPEN":           ohlcv["open"]   if ohlcv and ohlcv["open"]   > 0 else price,
-        "HIGH":           ohlcv["high"]   if ohlcv and ohlcv["high"]   > 0 else price,
-        "LOW":            ohlcv["low"]    if ohlcv and ohlcv["low"]    > 0 else price,
+        "OPEN":           open_,
+        "HIGH":           high,
+        "LOW":            low,
         "CLOSE":          price,
-        "VOLUME":         ohlcv["volume"] if ohlcv else safe_int(row.get("volume_avg_30d")),
+        "VOLUME":         volume,
         "CHANGE":         round(change, 2),
         "CHANGE%":        change_pct,
         "PE_RATIO":       safe_float(row.get("pe_ratio")),
@@ -121,32 +115,20 @@ def quote_to_stock(sym, df):
     })
 
 TOP_STOCKS = [
-    # Banks
     "HBL","UBL","MCB","ABL","BAFL","BAHL","MEBL","JSBL","NBP",
     "AKBL","SNBL","BOP","FAYSAL","SCBPL","PIBTL",
-    # Oil & Gas
     "OGDC","PPL","MARI","POL","PSO","APL","SHEL",
     "SNGP","SSGC","PARCO","BYCO","HASCOL","ATRL",
-    # Fertilizer
     "ENGRO","EFERT","FATIMA","FFC","FFBL",
-    # Cement
     "LUCK","DGKC","FCCL","KOHC","PIOC","CHCC","MLCF","GWLC",
     "BWCL","JVDC","THCCL","FLYNG","LPCL",
-    # Power
     "HUBC","KAPCO","KEL","NCPL","PKGP","JPGL","TSPL",
-    # Technology
     "TRG","SYS","NETSOL","AVN","TPLP","PSEL","HUMNL",
-    # Pharma
     "SEARL","ABOT","HINOON","GLAXO","FEROZ","SAPL","AGP",
-    # Auto
     "PSMC","INDU","HCAR","SAZEW","MTL","GHNL",
-    # Food
     "NESTLE","UNITY","TREET","QUICE","ISIL",
-    # Textile
     "NCL","KTML","NML","RCML","ADMM","GATM","SHFA",
-    # Chemical
     "LOTCHEM","ICI","SITC","EPCL","GTYR","AKZO",
-    # Misc
     "PAKT","PNSC","ASTL","ISL","MUGHAL","DAWH",
 ]
 
@@ -239,6 +221,8 @@ def fallback_report(symbol, price, change_pct, rsi, pe, reason=""):
         "target_1": target_1, "target_2": target_2, "risk_level": "medium",
     }
 
+# ─── Routes ─────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
     return {"status":"ok","groq":bool(GROQ_KEY),"gemini":bool(GEMINI_KEY)}
@@ -257,13 +241,19 @@ def symbols():
 
 @app.get("/market-watch")
 def market_watch():
+    """Fast — no OHLCV fetch per stock, just price+change"""
     result = []
     for sym in TOP_STOCKS:
         try:
             df = psxdata.quote(sym)
-            stock = quote_to_stock(sym, df)
-            if stock and stock["CLOSE"] > 0:
-                result.append(stock)
+            if df is None or len(df) == 0:
+                continue
+            row = df.iloc[0].to_dict()
+            price = safe_float(row.get("price"))
+            if price <= 0:
+                continue
+            stock = quote_row_to_stock(sym, row, include_ohlcv=False)
+            result.append(stock)
         except:
             continue
     if not result:
@@ -272,11 +262,13 @@ def market_watch():
 
 @app.get("/quote/{symbol}")
 def quote_endpoint(symbol: str):
+    """Detailed quote WITH real OHLCV — used by stock detail screen"""
     try:
         df = psxdata.quote(symbol.upper())
-        stock = quote_to_stock(symbol.upper(), df)
-        if not stock:
+        if df is None or len(df) == 0:
             raise HTTPException(status_code=404, detail="Not found")
+        row   = df.iloc[0].to_dict()
+        stock = quote_row_to_stock(symbol.upper(), row, include_ohlcv=True)
         return stock
     except HTTPException:
         raise
@@ -320,7 +312,7 @@ def research(body: dict):
         "Output ONLY valid JSON. No text before or after:\n"
         '{"recommendation":"buy","confidence":70,'
         '"summary":"3-4 sentence executive summary with specific insights.",'
-        '"technical_notes":"RSI interpretation, price action, key support/resistance.",'
+        '"technical_notes":"RSI interpretation, price action, support/resistance.",'
         '"fundamental_notes":"P/E valuation, dividend yield, sector position.",'
         '"news_impact":"Pakistan macro: interest rates, PKR, inflation, sector outlook.",'
         '"bull_case":"3 specific bullish catalysts for ' + symbol + '.",'
