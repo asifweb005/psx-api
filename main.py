@@ -285,40 +285,78 @@ def market_watch():
 @app.get("/quote/{symbol}")
 def quote_endpoint(symbol: str):
     """
-    Returns quote + today's OHLCV from PSX timeseries.
-    Format: [timestamp, close, volume, open] newest-first.
+    Returns quote enriched with best available OHLCV.
+    
+    Data sources:
+    - price, change_pct, pe_ratio, dividend_yield: psxdata.quote() (live)
+    - volume: volume_avg_30d from psxdata (30-day average — most reliable)
+    - OHLCV from timeseries: previous session EOD data (labelled as such)
+    
+    Note: PSX does not expose live intraday OHLCV via any public API.
+    The Open/High/Low shown are from the PREVIOUS trading session.
     """
     try:
         sym = symbol.upper()
-        # Base quote
         df = psxdata.quote(sym)
         if df is None or len(df) == 0:
             raise HTTPException(status_code=404, detail="Not found")
-        row   = df.iloc[0].to_dict()
-        stock = quote_row_to_stock(sym, row)
+        row = df.iloc[0].to_dict()
 
-        # Enrich with today's OHLCV from timeseries
+        price      = safe_float(row.get("price"))
+        change_pct = safe_float(row.get("change_pct"))
+        if change_pct != 0:
+            ldcp   = price / (1 + change_pct / 100)
+            change = price - ldcp
+        else:
+            ldcp   = price
+            change = 0.0
+
+        # Use 30-day avg volume — more meaningful than EOD volume
+        volume_avg = safe_int(row.get("volume_avg_30d"))
+
+        # Previous session OHLCV from timeseries
+        prev_open  = ldcp
+        prev_high  = ldcp
+        prev_low   = ldcp
+        prev_vol   = volume_avg
+        prev_close = ldcp
+
         try:
-            ts_data = fetch_psx_timeseries(sym, limit=1)
+            ts_data = fetch_psx_timeseries(sym, limit=2)
             if ts_data and len(ts_data) > 0:
-                latest = ts_data[0]  # newest first
+                # ts_data[0] = most recent EOD record
                 # [timestamp, close, volume, open]
-                if isinstance(latest, (list, tuple)) and len(latest) >= 4:
-                    open_  = safe_float(latest[3])
-                    close  = safe_float(latest[1])
-                    vol    = safe_int(latest[2])
-                    high   = max(open_, close)
-                    low    = min(open_, close)
-                    if open_ > 0:
-                        stock["OPEN"]   = open_
-                        stock["HIGH"]   = high
-                        stock["LOW"]    = low
-                        stock["VOLUME"] = vol
+                rec = ts_data[0]
+                if isinstance(rec, (list, tuple)) and len(rec) >= 4:
+                    prev_open  = safe_float(rec[3])
+                    prev_close = safe_float(rec[1])
+                    prev_vol   = safe_int(rec[2])
+                    prev_high  = max(prev_open, prev_close)
+                    prev_low   = min(prev_open, prev_close)
         except Exception as e:
-            print("OHLCV enrich failed: " + str(e))
-            # Keep defaults from psxdata.quote()
+            print("Timeseries fetch failed: " + str(e))
 
-        return stock
+        return sanitize({
+            "SYMBOL":          sym,
+            "COMPANY":         str(row.get("company") or sym),
+            "SECTOR":          sector_name(row.get("sector", "")),
+            "LDCP":            round(ldcp, 2),
+            "CLOSE":           price,           # live current price
+            "CHANGE":          round(change, 2),
+            "CHANGE%":         change_pct,
+            # Previous session OHLCV (best available without intraday API)
+            "OPEN":            prev_open,
+            "HIGH":            prev_high,
+            "LOW":             prev_low,
+            "VOLUME":          prev_vol,
+            "VOLUME_AVG_30D":  volume_avg,
+            # Fundamentals
+            "PE_RATIO":        safe_float(row.get("pe_ratio")),
+            "DIVIDEND_YIELD":  safe_float(row.get("dividend_yield")),
+            "CHANGE_1Y_PCT":   safe_float(row.get("change_1y_pct")),
+            "MARKET_CAP":      safe_float(row.get("market_cap")),
+            "LISTED_IN":       str(row.get("listed_in") or ""),
+        })
     except HTTPException:
         raise
     except Exception as e:
