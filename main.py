@@ -344,19 +344,23 @@ def research(body: dict):
 
 @app.get("/debug-history/{symbol}")
 def debug_history(symbol: str):
-    """Shows exact column names from psxdata.stocks()"""
+    """Test PSX timeseries endpoint directly"""
     try:
-        end   = datetime.today().strftime("%Y-%m-%d")
-        start = (datetime.today() - timedelta(days=7)).strftime("%Y-%m-%d")
-        df = psxdata.stocks(symbol.upper(), start=start, end=end)
-        if df is None or len(df) == 0:
-            return {"error": "No data", "symbol": symbol}
-        df_reset = df.reset_index()
-        last_row = df_reset.iloc[-1].to_dict()
-        return {
-            "columns": list(df_reset.columns),
-            "last_row": {str(k): str(v) for k, v in last_row.items()},
-            "row_count": len(df)
-        }
+        url = "https://dps.psx.com.pk/timeseries/eod/" + symbol.upper()
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://dps.psx.com.pk/",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            if isinstance(data, list) and len(data) > 0:
+                return {
+                    "success": True,
+                    "count": len(data),
+                    "sample_keys": list(data[0].keys()) if isinstance(data[0], dict) else str(data[0]),
+                    "last_record": data[-1] if isinstance(data[-1], dict) else str(data[-1])
+                }
+            return {"success": True, "data": str(data)[:500]}
     except Exception as e:
         return {"error": str(e)}
