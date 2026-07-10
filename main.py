@@ -399,3 +399,36 @@ def research(body: dict):
     except Exception as e:
         print("Research error: " + str(e))
         return fallback_report(symbol, price, change_pct, rsi, pe, str(e))
+
+@app.get("/debug-quote-full/{symbol}")
+def debug_quote_full(symbol: str):
+    """Show ALL available data from psxdata for a symbol"""
+    result = {}
+    sym = symbol.upper()
+    
+    # Try psxdata.quote()
+    try:
+        df = psxdata.quote(sym)
+        result["quote_columns"] = list(df.columns)
+        result["quote_data"] = {str(k): str(v) for k,v in df.iloc[0].to_dict().items()}
+    except Exception as e:
+        result["quote_error"] = str(e)
+    
+    # Try psxdata.tickers() for this symbol
+    try:
+        tickers = psxdata.tickers()
+        if sym in tickers:
+            result["in_tickers"] = True
+        else:
+            result["in_tickers"] = False
+    except Exception as e:
+        result["tickers_error"] = str(e)
+    
+    # Try PSX timeseries with limit=2 to see format
+    try:
+        ts = fetch_psx_timeseries(sym, limit=2)
+        result["timeseries_sample"] = ts
+    except Exception as e:
+        result["timeseries_error"] = str(e)
+    
+    return result
